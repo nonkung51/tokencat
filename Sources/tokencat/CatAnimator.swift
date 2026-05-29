@@ -13,7 +13,6 @@ final class CatAnimator {
     private let fpsMax = 18.0
     private let idleThreshold = 200.0 // tok/min at or below which we consider idle
     private let coastSeconds = 30.0   // keep running this long after the rate drops
-    private let sleepFPS = 0.8        // breathing-loop speed when asleep
 
     /// Emits (image, fallbackEmoji) for the current frame; image is nil only if
     /// sprite files are missing.
@@ -70,12 +69,16 @@ final class CatAnimator {
 
     private func restartTimer() {
         timer?.invalidate()
-        let interval: Double
-        switch state {
-        case .running(let fps): interval = 1.0 / max(fps, 0.1)
-        case .sleeping:         interval = 1.0 / sleepFPS
-        }
+        timer = nil
         emitCurrentFrame()
+
+        // While sleeping we show a single static frame and run NO timer at all.
+        // A menu-bar app that ticks ~once a second around the clock keeps the CPU
+        // awake and blocks App Nap — by far the worst battery offender here. The
+        // cat only animates when there's actually token activity to reflect.
+        guard case .running(let fps) = state else { return }
+
+        let interval = 1.0 / max(fps, 0.1)
         let t = Timer(timeInterval: interval, repeats: true) { [weak self] _ in self?.tick() }
         RunLoop.main.add(t, forMode: .common)
         timer = t

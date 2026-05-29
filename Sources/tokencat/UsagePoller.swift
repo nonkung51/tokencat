@@ -32,8 +32,24 @@ final class UsagePoller {
 
     private let queue = DispatchQueue(label: "tokencat.poller")
     private var timer: DispatchSourceTimer?
-    private var cachedBase: String?
     private var hasFetchedOnline = false
+
+    /// A resolved launch target: the absolute executable plus any fixed arg
+    /// prefix (e.g. `bunx ccusage`). Resolved once so we never pay for a login
+    /// shell per poll.
+    private struct Launcher { let executable: String; let argPrefix: [String] }
+    private var cachedLauncher: Launcher?
+
+    /// The `daily` per-agent totals barely move and only show in the menu, so we
+    /// refresh them far less often than the live block (which drives the cat).
+    private let agentRefreshInterval: TimeInterval = 300
+    private var lastAgentRefresh: Date?
+    private var cachedAgents: [AgentUsage] = []
+
+    /// When there's no active session we don't need to poll often. Back the
+    /// timer off to this while idle and snap back to `interval` once active.
+    private let idleInterval: TimeInterval = 60
+    private var scheduledInterval: TimeInterval = 0
 
     // Rolling-window samples of cumulative (input+output) for the live rate.
     private struct Sample { let time: Date; let fresh: Double; let blockStart: Date? }
@@ -60,10 +76,17 @@ final class UsagePoller {
 
     // MARK: - Scheduling
 
-    private func schedule() {
+    private func schedule() { reschedule(every: interval, fireNow: true) }
+
+    /// (Re)arm the timer at a given cadence. Generous leeway lets the OS coalesce
+    /// our wakeups with others, which is much kinder to the battery.
+    private func reschedule(every seconds: TimeInterval, fireNow: Bool) {
+        guard scheduledInterval != seconds || fireNow else { return }
+        scheduledInterval = seconds
         timer?.cancel()
         let t = DispatchSource.makeTimerSource(queue: queue)
-        t.schedule(deadline: .now(), repeating: interval, leeway: .seconds(1))
+        let deadline: DispatchTime = fireNow ? .now() : .now() + seconds
+        t.schedule(deadline: deadline, repeating: seconds, leeway: .seconds(5))
         t.setEventHandler { [weak self] in self?.poll() }
         t.resume()
         timer = t
@@ -81,10 +104,13 @@ final class UsagePoller {
     // MARK: - Polling
 
     private func poll() {
-        let base = resolveBase()
-        let offline = hasFetchedOnline ? " -O" : ""
+        guard let launcher = resolveLauncher() else {
+            publish(UsageSnapshot(state: .error("ccusage unavailable")))
+            return
+        }
+        let offlineArgs = hasFetchedOnline ? ["-O"] : []
 
-        guard let blocksJSON = runShell("\(base) blocks --active --json\(offline)"),
+        guard let blocksJSON = run(launcher, ["blocks", "--active", "--json"] + offlineArgs),
               let block = parseActiveBlock(blocksJSON) else {
             publish(UsageSnapshot(state: .error("ccusage unavailable")))
             return
@@ -101,18 +127,36 @@ final class UsagePoller {
         snap.blockStart = block.start
         debugLog("live=\(Int(snap.tokensPerMin))/min blockAvg=\(Int(block.blockAvg))/min fresh=\(Int(block.freshTokens))")
 
+        snap.agents = refreshAgentsIfDue(launcher, offlineArgs)
+
+        publish(snap)
+
+        // Idle sessions don't need frequent polling; back off to save battery and
+        // snap back to the configured cadence the moment a block goes active.
+        reschedule(every: block.active ? interval : max(interval, idleInterval), fireNow: false)
+    }
+
+    /// Per-agent daily totals change slowly and are only shown in the menu, so we
+    /// recompute them at most every `agentRefreshInterval`, reusing the cache
+    /// otherwise. This avoids spawning two extra `ccusage` processes every poll.
+    private func refreshAgentsIfDue(_ launcher: Launcher, _ offlineArgs: [String]) -> [AgentUsage] {
+        let now = Date()
+        if let last = lastAgentRefresh, now.timeIntervalSince(last) < agentRefreshInterval {
+            return cachedAgents
+        }
+
         var agents: [AgentUsage] = []
         for (name, sub) in [("Claude", "claude"), ("Codex", "codex")] {
-            let json = runShell("\(base) \(sub) daily --json\(offline)")
+            let json = run(launcher, [sub, "daily", "--json"] + offlineArgs)
             let parsed = json.flatMap(parseDailyToday)
             debugLog("\(sub) daily: bytes=\(json?.count ?? -1) parsed=\(parsed != nil)")
             if let today = parsed {
                 agents.append(AgentUsage(name: name, tokens: today.tokens, cost: today.cost))
             }
         }
-        snap.agents = agents
-
-        publish(snap)
+        cachedAgents = agents
+        lastAgentRefresh = now
+        return agents
     }
 
     /// Self-computed recent burn rate, per minute. ccusage's own indicator is a
@@ -144,20 +188,42 @@ final class UsagePoller {
         return (block.freshTokens - first.fresh) / minutes
     }
 
-    /// Use `ccusage` if on PATH, else `bunx ccusage`. Resolved once.
-    private func resolveBase() -> String {
-        if let base = cachedBase { return base }
-        let probe = runShell("command -v ccusage")?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let base = (probe?.isEmpty == false) ? "ccusage" : "bunx ccusage"
-        cachedBase = base
-        return base
+    /// Resolve, exactly once, the absolute path to either `ccusage` or `bunx`.
+    /// The one-time probe pays for a login shell so we pick up the user's PATH;
+    /// every subsequent poll then execs the resolved binary directly, with no
+    /// shell at all — the original code re-sourced `.zshrc` on every call.
+    private func resolveLauncher() -> Launcher? {
+        if let cached = cachedLauncher { return cached }
+        if let ccusage = which("ccusage") {
+            cachedLauncher = Launcher(executable: ccusage, argPrefix: [])
+        } else if let bunx = which("bunx") {
+            cachedLauncher = Launcher(executable: bunx, argPrefix: ["ccusage"])
+        }
+        return cachedLauncher
+    }
+
+    /// One-time absolute-path lookup via a login shell (so user PATH is honored).
+    private func which(_ tool: String) -> String? {
+        guard let path = runShell("command -v \(tool)")?
+            .trimmingCharacters(in: .whitespacesAndNewlines), !path.isEmpty else { return nil }
+        return path
+    }
+
+    /// Exec the resolved launcher directly — no shell per call.
+    private func run(_ launcher: Launcher, _ args: [String]) -> String? {
+        return launch(URL(fileURLWithPath: launcher.executable), launcher.argPrefix + args)
     }
 
     /// Run a command in a login shell, returning stdout (stderr → /dev/null).
+    /// Used only for the one-time PATH probe.
     private func runShell(_ command: String) -> String? {
+        return launch(URL(fileURLWithPath: "/bin/zsh"), ["-lc", command])
+    }
+
+    private func launch(_ executable: URL, _ arguments: [String]) -> String? {
         let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/bin/zsh")
-        proc.arguments = ["-lc", command]
+        proc.executableURL = executable
+        proc.arguments = arguments
         let out = Pipe()
         proc.standardOutput = out
         proc.standardError = FileHandle.nullDevice
